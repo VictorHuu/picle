@@ -131,6 +131,29 @@ def parse_predictions(text, first_round, last_round):
     return values
 
 
+def distribution_metrics(predictions, targets):
+    """Return empirical 1-Wasserstein distance and two-sample KS statistic.
+
+    Both inputs contain the same held-out rounds for which the model returned
+    a valid reserve price. W1 is reported in reserve-price units (0-100).
+    """
+    if not predictions:
+        return None, None, 0
+    predicted = sorted(predictions)
+    observed = sorted(targets)
+    count = len(predicted)
+    w1 = sum(abs(left - right) for left, right in zip(predicted, observed)) / count
+    support = sorted(set(predicted) | set(observed))
+    ks = max(
+        abs(
+            sum(value <= point for value in predicted) / count
+            - sum(value <= point for value in observed) / count
+        )
+        for point in support
+    )
+    return w1, ks, count
+
+
 def run_group(wrapper, rows, group, instructions, args, methods):
     context_num = args.context_num
     context = rows[:context_num]
@@ -149,6 +172,7 @@ def run_group(wrapper, rows, group, instructions, args, methods):
     selected_demos = [(index + 1, context[index]) for index in selected]
 
     output = []
+    metric_output = []
     for mode in methods:
         demos = transform_demonstrations(selected_demos, mode, args.seed, context_num)
         messages_demos = []
@@ -180,6 +204,21 @@ def run_group(wrapper, rows, group, instructions, args, methods):
         with base_model_context(wrapper):
             generated = generate_text(wrapper, prompt, max_new_tokens=args.max_new_tokens)
         predictions = parse_predictions(generated, context_num + 1, len(rows))
+        scored = [
+            (predictions[round_id], int(row["rPrice"]))
+            for round_id, row in future if round_id in predictions
+        ]
+        w1, ks, n_scored = distribution_metrics(
+            [prediction for prediction, _ in scored],
+            [target for _, target in scored],
+        )
+        metric_output.append({
+            "bidder_group": group,
+            "mode": mode,
+            "n_scored": n_scored,
+            "w1_reserve_price": w1,
+            "ks_distance": ks,
+        })
         for round_id, row in future:
             output.append({
                 "bidder_group": group, "mode": mode, "round": round_id,
@@ -192,7 +231,7 @@ def run_group(wrapper, rows, group, instructions, args, methods):
     del features, base_scores, sft_scores, delta
     gc.collect()
     torch.cuda.empty_cache()
-    return output
+    return output, metric_output
 
 
 def parse_args():
@@ -203,6 +242,7 @@ def parse_args():
     parser.add_argument("--model_dir", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--output_dir", default="checkpoints/qwen")
     parser.add_argument("--results_file", default="out/qwen/auction_picle.csv")
+    parser.add_argument("--metrics_file", default="out/qwen/auction_picle_metrics.csv")
     parser.add_argument("--context_num", type=int, default=30)
     parser.add_argument("--K", type=int, default=3)
     parser.add_argument("--epochs", type=int, default=4)
@@ -227,20 +267,30 @@ def main():
 
     wrapper = QwenWrapper(args.model_dir, "bfloat16", False, args.max_input_len)
     result_path = Path(args.results_file)
+    metrics_path = Path(args.metrics_file)
     result_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not result_path.exists()
+    write_metrics_header = not metrics_path.exists()
     with result_path.open("a", newline="", encoding="utf-8") as stream:
         fields = ["bidder_group", "mode", "round", "prediction", "human_reserve_price", "num_bidders", "delta_selected"]
         writer = csv.DictWriter(stream, fieldnames=fields)
         if write_header:
             writer.writeheader()
-        for group in selected_groups:
-            if group not in groups or len(groups[group]) < args.context_num + 1:
-                continue
-            rows = groups[group][:60]
-            for record in run_group(wrapper, rows, group, instructions, args, methods):
-                writer.writerow(record)
-            stream.flush()
+        with metrics_path.open("a", newline="", encoding="utf-8") as metrics_stream:
+            metric_fields = ["bidder_group", "mode", "n_scored", "w1_reserve_price", "ks_distance"]
+            metrics_writer = csv.DictWriter(metrics_stream, fieldnames=metric_fields)
+            if write_metrics_header:
+                metrics_writer.writeheader()
+            for group in selected_groups:
+                if group not in groups or len(groups[group]) < args.context_num + 1:
+                    continue
+                rows = groups[group][:60]
+                records, group_metrics = run_group(wrapper, rows, group, instructions, args, methods)
+                writer.writerows(records)
+                metrics_writer.writerows(group_metrics)
+                stream.flush()
+                metrics_stream.flush()
 
 
 if __name__ == "__main__":
