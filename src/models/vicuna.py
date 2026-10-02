@@ -1,4 +1,4 @@
-import os
+from models.scoring import generate_text, input_device, load_adapter, score_answers
 
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 from accelerate.utils import get_max_memory
@@ -36,11 +36,13 @@ def load_vicuna(model_name_or_path, memory_for_model_activations_in_gb=2, peft_p
 
 def gather_last_token(tensor, lengths):
     batch_size = tensor.size(0)
-    return tensor[torch.arange(batch_size, device=tensor.device), -1, :]
+    return tensor[torch.arange(batch_size, device=tensor.device), lengths.to(tensor.device) - 1, :]
     # return tensor[torch.arange(batch_size, device=tensor.device), lengths - 1, :]
 
 
 class VicunaWrapper(object):
+    family = "vicuna"
+    max_input_len = 1024
     def __init__(self, model_dir, lora_adapter_path=None, memory_for_model_activations_in_gb=2):
         super(VicunaWrapper, self).__init__()
         self.name = model_dir
@@ -56,16 +58,15 @@ class VicunaWrapper(object):
 
     def __call__(self, batch, output_log_likelihood=True, output_hidden_states=False, hidden_states_layers_to_output=(-1, -.5), output_only_last_token_hidden_states=False):
         with torch.no_grad():
-            input_ids_cuda = batch['input_ids'].cuda()
-            model_output = self.huggingface_model(input_ids=input_ids_cuda, attention_mask=batch['attention_mask'].cuda(), output_hidden_states=output_hidden_states)
+            input_ids_cuda = batch['input_ids'].to(input_device(self))
+            model_output = self.huggingface_model(input_ids=input_ids_cuda, attention_mask=batch['attention_mask'].to(input_device(self)), output_hidden_states=output_hidden_states)
             
             logits_before_softmax = model_output['logits'].float()[:, :-1, :]
             next_token_logit = model_output['logits'].float()[:, -1:, :]
             if output_log_likelihood:
                 logits = torch.nn.functional.log_softmax(logits_before_softmax, dim=2)
                 tokens_log_likelihood = -1. * torch.nn.functional.nll_loss(logits.permute(0, 2, 1), input_ids_cuda[:, 1:], reduction="none").detach().cpu()
-                _, grid_y = torch.meshgrid(torch.arange(len(batch['length']), device=batch['length'].device), torch.arange(batch['input_ids'].shape[1] - 1, device=batch['length'].device), indexing='ij')
-                actual_token_vs_padding_tokens_mask = grid_y < batch['length'][:, None]
+                actual_token_vs_padding_tokens_mask = (batch['attention_mask'][:, 1:] * batch['attention_mask'][:, :-1]).cpu()
                 log_likelihood = (tokens_log_likelihood * actual_token_vs_padding_tokens_mask).sum(dim=1)
             else:
                 tokens_log_likelihood = None
@@ -93,7 +94,7 @@ class VicunaWrapper(object):
     def forward_whole_dataset(self, dataset, batch_size, output_tokens_log_likelihood=False, output_logits_before_softmax=False, **kwargs):
         res = None
         for i, current_res in enumerate(self._forward_whole_dataset_generator(dataset, batch_size, **kwargs)):
-            current_hidden_states, current_logits_before_softmax, current_tokens_log_likelihood, current_log_likelihood = current_res
+            current_hidden_states, current_logits_before_softmax, current_tokens_log_likelihood, current_log_likelihood, _ = current_res
             if res is None:
                 res = [None, None, None, None]
                 if current_hidden_states is not None:
@@ -120,66 +121,11 @@ class VicunaWrapper(object):
         return tuple(res)
 
     def change_lora_adapter(self, new_lora_adapter_path):
-        from safetensors.torch import load_file
-        peft_model_state_dict = load_file(os.path.join(new_lora_adapter_path, 'adapter_model.safetensors'))
-        model_state_dict =  self.huggingface_model.state_dict()
-        for k, v in peft_model_state_dict.items():
-            A = k.split('.')
-            if A[-2] == 'lora_A':
-                B = A.copy()
-                B[-2] = 'lora_B'
-                B_k = '.'.join(B)
-            else :
-                continue
-
-            D_W = peft_model_state_dict[B_k].to(self.huggingface_model.device) @ peft_model_state_dict[k].to(self.huggingface_model.device)
-            orig_name = '.'.join(A[2:-2] + A[-1:])
-            model_state_dict[orig_name] = model_state_dict[orig_name] + D_W
-        self.huggingface_model.load_state_dict(model_state_dict, strict=True)
-
-
+        load_adapter(self, new_lora_adapter_path)
 
     def generate(self, args, query, return_logits=True, verbose=False):
-        gen = self.huggingface_model.generate(
-            torch.tensor([self.tokenizer(query)['input_ids']]).cuda(), 
-            do_sample=False, 
-            max_new_tokens=10,
-            return_dict_in_generate=True,
-            output_scores=True,
-            pad_token_id=self.tokenizer.eos_token_id
-        )
-        response = ''
-        for score in gen.scores:
-            response += self.tokenizer.convert_ids_to_tokens(score[0].argmax().item())
-        response = response.replace('▁',' ').replace('</s>', '').strip()
-        response = ''.join([x.replace("<0x0A>", "") for x in response.split("<0x0A>")])
-        if verbose :
-            print('query:', query)
-            print('response:', response)
-        
-        if return_logits:
-            map_dict = {
-                'yes':[3582,4874], 'yes.':[3582,4874], 'Yes':[3869,8241], 'Yes.':[3869,8241],
-                'YES':[21143,22483], 'YES.':[21143,22483], 'no':[694,1217], 'no.':[694,1217],
-                'No':[1939,3782], 'No.':[1939,3782], 'NO':[6632,11698], 'NO.':[6632,11698]
-            }
-            gen_num = len(gen.scores)
-            gen_tok_idx = gen.sequences[0][-gen_num:]
-            tok_idx = None
-            logits = None
-            if response in map_dict.keys():
-                for i in map_dict[response]:
-                    try:
-                        tok_idx = list(gen_tok_idx.cpu().numpy()).index(i)
-                        logits = gen.scores[tok_idx][0]
-                        break
-                    except:
-                        logits = None
-                        continue
-            return response, logits
-        return response
-
-def create_zero_shot_prompt(tokenizer, system_message, instruction):
-    return tokenizer.encode(
-        f"{B_SYS}{system_message}{E_SYS}{B_INST} {instruction.strip()} {E_INST} Answer:", return_tensors='pt'
-    )
+        response = generate_text(self, query)
+        if verbose:
+            print(query, response, sep="\n")
+        # Scores are complete No/Yes string log-probabilities, in that order.
+        return (response, score_answers(self, query)[0]) if return_logits else response
