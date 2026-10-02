@@ -137,6 +137,30 @@ Use the same precision/quantization setting for training, Base/SFT scoring and
 all compared methods. The script passes this setting to every stage.
 A 7B GPU training/evaluation run has not been performed in the editing environment.
 
+## PICLe on the auction-history ablations
+
+`src/auction_picle.py` applies PICLe's persona-LoRA likelihood difference and
+Top-K selection to the first 30 rounds of each human auction history, then
+predicts the remaining rounds with the base Qwen model. It runs only PICLe; it
+does not run the other selection baselines.
+
+```bash
+python src/auction_picle.py --mode all
+```
+
+This reads the published auction CSV and instructions from the paper's public
+repository on first run. Use `--bidder_groups S.1 S.2` to restrict participant
+groups, or `--mode direct`, `mask`, `reverse`, `shuffle`, or `regionshuffle` to
+run one PICLe condition. `Mask` hides round numbers in the selected examples;
+`RegionShuffle` shuffles selected examples within rounds 1–15 and 16–30. The
+paper text defines Mask as masking round numbers, while its released helper
+script masks dropout-price lists; this implementation follows the paper text.
+
+The participant's first 30 decisions are used for participant-specific LoRA
+SFT and as PICLe candidate demonstrations. PICLe selects Top-K by
+`log p_SFT(x) - log p_Base(x)`; the selected examples are then reordered or
+masked for each condition. Final prediction uses Qwen with the adapter disabled.
+
 ## Original-code fixes
 
 Separate from Qwen support:
