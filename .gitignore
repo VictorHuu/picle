@@ -1,4 +1,7 @@
 src/llama/
-src/__pycache__/
+__pycache__/
+*.pyc
+.venv/
 wandb/
 out/
+checkpoints/

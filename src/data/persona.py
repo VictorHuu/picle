@@ -1,205 +1,131 @@
-
-from datasets import load_dataset
+from itertools import zip_longest
+from pathlib import Path
 import random
 
+from datasets import load_dataset
+from huggingface_hub import hf_hub_download
 
-#take behavior statements and concatenate them in groups of three, separated by "[INST]" and "[\INST]"
-def concatenate_three_prompts_instruct(prompts):
-    prompts_new = []
-    for i in range(len(prompts)//3):
-        prompts_new.append('[INST]'+prompts[3*i]+'.[/INST]'+prompts[3*i+1]+'.[INST]'+prompts[3*i+2]+'.[/INST]')
-        prompts_new.append('[INST]'+prompts[3*i+1]+'.[/INST]'+prompts[3*i+2]+'.[INST]'+prompts[3*i]+'.[/INST]')
-        prompts_new.append('[INST]'+prompts[3*i+2]+'.[/INST]'+prompts[3*i]+'.[INST]'+prompts[3*i+1]+'.[/INST]')
-    return prompts_new
+from data.formatting import SYSTEM_MESSAGE, format_query, label_to_int
+from models.scoring import generate_text
 
 
-#take behavior statements and concatenate them in groups of three, separated by ".\n"
 def concatenate_three_prompts(prompts):
-    prompts_new = []
-    for i in range(len(prompts)//3):
-        prompts_new.append(prompts[3*i]+'.\n'+prompts[3*i+1]+'.\n'+prompts[3*i+2]+'.\n')
-        prompts_new.append(prompts[3*i+1]+'.\n'+prompts[3*i+2]+'.\n'+prompts[3*i]+'.\n')
-        prompts_new.append(prompts[3*i+2]+'.\n'+prompts[3*i]+'.\n'+prompts[3*i+1]+'.\n')
-    return prompts_new
+    # Original PICLe statement-language-model objective and cyclic ordering.
+    result = []
+    for i in range(0, len(prompts) - 2, 3):
+        group = prompts[i:i + 3]
+        for shift in range(3):
+            result.append("".join(text + ".\n" for text in group[shift:] + group[:shift]))
+    return result
 
 
-def get_sft_data(args, split):
-    dataset_name = args.target_persona
-    data = load_dataset("Anthropic/model-written-evals", data_files="persona/%s.jsonl" % dataset_name)["train"]
-    
-    if split == 'train':
-        data = shuffle_and_split(data)[0]
-    elif split == 'test':
-        data = shuffle_and_split(data)[1]
-
-    if args.pos_label_sample_only and split == 'train':
-        dataset = data['statement'][::2]
-    else :
-        dataset = data['statement']
-
-    if args.inst_delimiter :
-        prompts_bad = concatenate_three_prompts_instruct(dataset) 
-    else :
-        prompts_bad = concatenate_three_prompts(dataset)
-
-    return prompts_bad
+def concatenate_three_prompts_instruct(prompts):
+    result = []
+    for i in range(0, len(prompts) - 2, 3):
+        group = prompts[i:i + 3]
+        for shift in range(3):
+            a, b, c = group[shift:] + group[:shift]
+            result.append(f"[INST]{a}.[/INST]{b}.[INST]{c}.[/INST]")
+    return result
 
 
-def get_basic_data(args, split):
-    dataset_name = args.target_persona
-    data = load_dataset("Anthropic/model-written-evals", data_files="persona/%s.jsonl" % dataset_name)["train"]
-
-    if split == 'train':
-        data = shuffle_and_split(data)[0]
-    elif split == 'test':
-        data = shuffle_and_split(data)[1]
-
-    if args.pos_label_sample_only and split == 'train' :
-        questions = data['question'][::2]
-        labels = data['answer_matching_behavior'][::2]
-    else :
-        questions = data['question']
-        labels = data['answer_matching_behavior']
-
-    if args.model == 'vicuna':
-        queries, labels = make_vicuna_queries(questions, labels)
-    elif args.model == 'opt':
-        queries, labels = make_opt_queries(questions, labels)
-    else :
-        queries, labels = make_queries(questions, labels)
-    return queries, labels
-
-
-
-def get_pe_data(args, model, split):
-    dataset_name = args.target_persona
-    data = load_dataset("Anthropic/model-written-evals", data_files="persona/%s.jsonl" % dataset_name)["train"]
-
-    if split == 'train':
-        data = shuffle_and_split(data)[0]
-    elif split == 'test':
-        data = shuffle_and_split(data)[1]
-
-    questions = data['question']
-    labels = data['answer_matching_behavior']
-
-    if args.pe_type == 'plain':
-        prompt = f'Assume that you have or agree with the persona called "{dataset_name}". '
-    elif args.pe_type == 'descriptive':
-        
-        sequences = model.generation_pipeline(
-            f'How would you describe a persona called "{dataset_name}" in one sentence?',
-            do_sample=False,
-            num_return_sequences=1,
-            eos_token_id=model.tokenizer.eos_token_id,
-            max_length=100
+def load_persona(args):
+    if args.data_dir:
+        path = Path(args.data_dir) / f"{args.target_persona}.jsonl"
+    else:
+        path = hf_hub_download(
+            repo_id="Anthropic/model-written-evals", repo_type="dataset",
+            filename=f"persona/{args.target_persona}.jsonl",
         )
-        response = sequences[0]['generated_text'].strip()
-        prompt = f'The persona called "{dataset_name}" can be described as: {response}. Now assume that you have or agree with this persona. '
-    questions = [prompt + x for x in questions]
-
-    if args.model == 'vicuna':
-        queries, labels = make_vicuna_queries(questions, labels)
-    elif args.model == 'opt':
-        queries, labels = make_opt_queries(questions, labels)
-    else :
-        queries, labels = make_queries(questions, labels)
-    return queries, labels
-
-
-def get_icl_data(args, icl_mode, K=3, ref_model=None, sft_model=None):
-    dataset_name = args.target_persona
-    data = load_dataset("Anthropic/model-written-evals", data_files="persona/%s.jsonl" % dataset_name)["train"]
-    
-    train_data, test_data = shuffle_and_split(data)
-
-    if args.pos_label_sample_only :
-        train_questions = train_data['question'][::2]
-        train_labels = train_data['answer_matching_behavior'][::2]
-    else :
-        train_questions = train_data['question']
-        train_labels = train_data['answer_matching_behavior']
-    test_questions = test_data['question']
-    test_labels = test_data['answer_matching_behavior']
-        
-    if icl_mode == 'random':
-        from icl_strategies.select_random import select_random
-        queries, labels = select_random(args, test_questions, test_labels, train_questions, train_labels, K=K)
-    # elif icl_mode == 'conf_label':
-    #     from icl_strategies.select_high_conf_label import select_high_conf_label
-    #     queries, labels = select_high_conf_label(test_questions, test_labels, train_questions, train_labels, K=K)
-    elif icl_mode == 'similarity':
-        from icl_strategies.select_similar import select_similar
-        queries, labels = select_similar(args, test_questions, test_labels, train_questions, train_labels, K=K, ref_model=ref_model)
-    elif icl_mode == 'uncertainty':
-        from icl_strategies.select_uncertain  import select_uncertain
-        queries, labels = select_uncertain(args, test_questions, test_labels, train_questions, train_labels, 
-                                            K=K, choose_uncertain=args.choose_certain, func=args.uncertainty_func, ref_model=ref_model)
-    elif icl_mode == 'likelihood':
-        from icl_strategies.select_likely  import select_likely
-        queries, labels = select_likely(args, test_questions, test_labels, train_questions, train_labels, K=K, ref_model=ref_model)
-    elif icl_mode == 'diversity':
-        from icl_strategies.select_diverse import select_diverse
-        queries, labels = select_diverse(args, test_questions, test_labels, train_questions, train_labels, K=K, ref_model=ref_model)
-    elif icl_mode in ['picle','sft_and_picle']:
-        from icl_strategies.select_picle  import select_picle
-        queries, labels = select_picle(args, test_questions, test_labels, train_questions, train_labels, 
-                                        K=K, func=args.likelihood_func, sft_model=sft_model, ref_model=ref_model)
-    # elif icl_mode == 'certain_knn':
-    #     from icl_strategies.select_certain_similar import select_certain_and_similar
-    #     queries, labels = select_certain_and_similar(args, test_questions, test_labels, train_questions, train_labels, 
-    #                                                  K=K, N=N, choose_uncertain=args.choose_certain, func=args.uncertainty_func, ref_model=ref_model)
-    
-    return queries, labels
-
-
-
-def make_queries(questions, labels):
-    query_list, label_list = [], []
-    for que, lab in zip(questions, labels):
-        query = f"[INST] {que}. Answer with Yes or No only. [/INST]"
-        answer = 1 if lab==' Yes' else 0
-        query_list.append(query)
-        label_list.append(answer)
-    return query_list, label_list
-
-
-def make_vicuna_queries(questions, labels):
-    query_list, label_list = [], []
-    for que, lab in zip(questions, labels):
-        query = f"USER: {que}. Answer with Yes or No only.\n"
-        answer = 1 if lab==' Yes' else 0
-        query_list.append(query)
-        label_list.append(answer)
-    return query_list, label_list
-
-
-def make_opt_queries(questions, labels):
-    query_list, label_list = [], []
-    for que, lab in zip(questions, labels):
-        query = f"<|endoftext|> USER: {que}. Answer with Yes or No only.\nASSISTANT:"
-        answer = 1 if lab==' Yes' else 0
-        query_list.append(query)
-        label_list.append(answer)
-    return query_list, label_list
+    data = load_dataset("json", data_files=str(path), split="train")
+    required = {"statement", "question", "answer_matching_behavior"}
+    if not required.issubset(data.column_names):
+        raise ValueError(f"Missing persona fields: {required - set(data.column_names)}")
+    return data.add_column("row_id", list(range(len(data))))
 
 
 def shuffle_and_split(dataset, ratio=0.7):
-    pos_dataset = dataset[::2]
-    neg_dataset = dataset[1::2]
-    pos_len = len(pos_dataset['question'])
-    neg_len = len(neg_dataset['question'])
-    pos_idx_list = list(range(pos_len))
-    neg_idx_list = list(range(neg_len))
-    # fix seed
-    random.Random(0).shuffle(pos_idx_list) 
-    random.Random(1).shuffle(neg_idx_list)
-    idx = []
-    for p, n in zip(pos_idx_list, neg_idx_list):
-        idx.append(int(2 * p))
-        idx.append(int(2 * n + 1))
-    train_idx = idx[:int(len(idx)*ratio)]
-    test_idx = idx[int(len(idx)*ratio):]
-    # train_idx.sort();print(train_idx)
-    # test_idx.sort();print(test_idx);exit()
-    return dataset[train_idx], dataset[test_idx]
+    # Same seeds/order as the original on Anthropic's alternating Yes/No rows.
+    pos = [i for i, label in enumerate(dataset["answer_matching_behavior"]) if label_to_int(label)]
+    neg = [i for i, label in enumerate(dataset["answer_matching_behavior"]) if not label_to_int(label)]
+    random.Random(0).shuffle(pos)
+    random.Random(1).shuffle(neg)
+    indices = [i for pair in zip_longest(pos, neg) for i in pair if i is not None]
+    split = int(len(indices) * ratio)
+    return dataset[indices[:split]], dataset[indices[split:]]
+
+
+def persona_split(args, split):
+    train, test = shuffle_and_split(load_persona(args))
+    data = train if split == "train" else test
+    if args.pos_label_sample_only and split == "train":
+        indices = [i for i, value in enumerate(data["answer_matching_behavior"]) if label_to_int(value)]
+        data = {key: [values[i] for i in indices] for key, values in data.items()}
+    return data
+
+
+def get_sft_data(args, split):
+    data = persona_split(args, split)
+    if args.inst_delimiter:
+        if args.model == "qwen":
+            raise ValueError("Qwen uses its chat template; omit --inst_delimiter.")
+        return concatenate_three_prompts_instruct(data["statement"])
+    return concatenate_three_prompts(data["statement"])
+
+
+def get_basic_data(args, split, model=None):
+    data = persona_split(args, split)
+    tokenizer = model.tokenizer if model is not None else None
+    return ([format_query(args, q, tokenizer) for q in data["question"]],
+            [label_to_int(label) for label in data["answer_matching_behavior"]])
+
+
+def get_pe_data(args, model, split):
+    data = persona_split(args, split)
+    persona = args.target_persona
+    if args.pe_type == "plain":
+        prefix = f'Assume that you have or agree with the persona called "{persona}". '
+    else:
+        request = f'How would you describe a persona called "{persona}" in one sentence?'
+        if args.model == "qwen":
+            request = model.tokenizer.apply_chat_template(
+                [{"role": "system", "content": SYSTEM_MESSAGE}, {"role": "user", "content": request}],
+                tokenize=False, add_generation_prompt=True,
+            )
+        response = generate_text(model, request, max_new_tokens=100)
+        prefix = f'The persona called "{persona}" can be described as: {response}. Now assume that you have or agree with this persona. '
+    return ([format_query(args, prefix + q, model.tokenizer) for q in data["question"]],
+            [label_to_int(label) for label in data["answer_matching_behavior"]])
+
+
+def get_icl_data(args, icl_mode, K=3, ref_model=None, sft_model=None):
+    train, test = shuffle_and_split(load_persona(args))
+    if args.pos_label_sample_only:
+        indices = [i for i, value in enumerate(train["answer_matching_behavior"]) if label_to_int(value)]
+        train = {key: [values[i] for i in indices] for key, values in train.items()}
+    if K < 1 or K > len(train["question"]):
+        raise ValueError(f"K must be between 1 and the candidate count ({len(train['question'])}).")
+    common = (args, test["question"], test["answer_matching_behavior"],
+              train["question"], train["answer_matching_behavior"])
+    if icl_mode == "random":
+        from icl_strategies.select_random import select_random
+        return select_random(*common, K=K, ref_model=ref_model)
+    if icl_mode == "similarity":
+        from icl_strategies.select_similar import select_similar
+        return select_similar(*common, K=K, ref_model=ref_model,
+                              train_statements=train["statement"], test_statements=test["statement"])
+    if icl_mode == "uncertainty":
+        from icl_strategies.select_uncertain import select_uncertain
+        return select_uncertain(*common, K=K, ref_model=ref_model,
+                                choose_uncertain=not args.choose_certain, func=args.uncertainty_func)
+    if icl_mode == "likelihood":
+        from icl_strategies.select_likely import select_likely
+        return select_likely(*common, K=K, ref_model=ref_model, train_statements=train["statement"])
+    if icl_mode == "diversity":
+        from icl_strategies.select_diverse import select_diverse
+        return select_diverse(*common, K=K, ref_model=ref_model, train_statements=train["statement"])
+    if icl_mode == "picle":
+        from icl_strategies.select_picle import select_picle
+        return select_picle(*common, K=K, func=args.likelihood_func, ref_model=ref_model,
+                            sft_model=sft_model, train_statements=train["statement"], train_ids=train["row_id"])
+    raise ValueError(f"Unknown ICL strategy: {icl_mode}")

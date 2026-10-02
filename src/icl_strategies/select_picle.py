@@ -1,44 +1,38 @@
-from tqdm import tqdm
-import torch
+import csv
+from pathlib import Path
 
-def select_picle(args, test, test_labels, train, train_labels, K, func, ref_model, sft_model):
-    likelihood = get_likelihood(args, train, ref_model, sft_model, func)
-    val, idx = likelihood.topk(K)
-    
-    prompt = ''
-    for i in idx.flip(0):
-        question = train[i.item()]
-        answer = train_labels[i.item()]
-        if args.model == 'vicuna':
-            prompt += 'USER: ' + question + '\nASSISTANT: ' + answer.strip() + '. </s>\n'
-        elif args.model == 'opt':
-            prompt += 'USER: ' + question + '\nASSISTANT: ' + answer.strip() + '. <|endoftext|>\n'
-        else :
-            prompt += '<s> [INST] ' + question + ' [/INST] ' + answer.strip() + '. </s> '
-    
-    icl_test, icl_test_labels = [], []
-    for x, y in zip(test, test_labels):
-        label = 1 if y==' Yes' else 0
-        if args.model == 'vicuna':
-            icl_test.append(prompt + 'USER: ' + x + '. Answer with Yes or No only.\n')
-        elif args.model == 'opt':
-            icl_test.append(prompt + 'USER: ' + x + '. Answer with Yes or No only.\nASSISTANT:')
-        else :
-            icl_test.append(prompt + '<s> [INST] ' + x + '. Answer with Yes or No only. [/INST]')
-        icl_test_labels.append(label)
-        
-    return icl_test, icl_test_labels
+from data.formatting import format_icl_queries, statement_from_question
+from models.scoring import base_model_context, score_features, statement_feature
 
-    
-def get_likelihood(args, dataset, ref_model, sft_model, func='diff'):
-    dataset = [x[x.index("\n"):][2:-1] + '.\n' for x in dataset]
-    tokens = sft_model.tokenizer(dataset)
-    lls = []
-    for data, mask in tqdm(zip(tokens['input_ids'], tokens['attention_mask']), total=len(dataset)):
-        inp = {'input_ids': torch.tensor([data]), 'attention_mask': torch.tensor([mask]), 'length':torch.tensor([len(data)])}
-        loglikelihood = sft_model(inp, output_hidden_states=True, hidden_states_layers_to_output=(-1,), output_only_last_token_hidden_states=True)[-2][0]
-        if func == 'diff' :
-            ref_loglikelihood = ref_model(inp, output_hidden_states=True, hidden_states_layers_to_output=(-1,), output_only_last_token_hidden_states=True)[-2][0]
-            loglikelihood = loglikelihood - ref_loglikelihood
-        lls.append(loglikelihood)
-    return torch.tensor(lls).cuda()
+
+def get_likelihood(args, dataset, ref_model, sft_model=None, func="diff", train_statements=None):
+    statements = train_statements if train_statements is not None else [statement_from_question(x) for x in dataset]
+    features = [statement_feature(ref_model, statement + ".\n") for statement in statements]
+    # Reuse exactly the same token IDs and masks, switching only the adapter.
+    # Base scores stay on CPU; no second copy of the 7B model is loaded.
+    with base_model_context(ref_model):
+        base_scores = score_features(ref_model, features, "Base likelihood")
+    persona_model = sft_model if sft_model is not None else ref_model
+    sft_scores = score_features(persona_model, features, "Persona likelihood")
+    scores = sft_scores - base_scores if func == "diff" else sft_scores
+    return scores, base_scores, sft_scores
+
+
+def select_picle(args, test, test_labels, train, train_labels, K, func, ref_model,
+                 sft_model=None, train_statements=None, train_ids=None):
+    scores, base_scores, sft_scores = get_likelihood(
+        args, train, ref_model, sft_model, func, train_statements,
+    )
+    # Highest-scoring demonstration comes closest to the test query.
+    selected = scores.topk(K).indices.flip(0).tolist()
+    folder = Path(args.results_dir) / args.target_persona
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / "picle_selection.csv").open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["row_id", "statement", "answer", "base_logp", "sft_logp", "delta", "context_position"])
+        for i, question in enumerate(train):
+            statement = train_statements[i] if train_statements is not None else statement_from_question(question)
+            writer.writerow([train_ids[i] if train_ids is not None else i, statement, train_labels[i].strip(),
+                             base_scores[i].item(), sft_scores[i].item(), (sft_scores[i] - base_scores[i]).item(),
+                             selected.index(i) + 1 if i in selected else ""])
+    return format_icl_queries(args, test, test_labels, train, train_labels, [selected] * len(test), ref_model)
