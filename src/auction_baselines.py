@@ -3,6 +3,7 @@
 import argparse
 import csv
 import random
+import re
 from pathlib import Path
 
 import torch
@@ -14,11 +15,11 @@ from auction_picle import (
     distribution_metrics,
     fetch_if_missing,
     load_groups,
-    parse_predictions,
     round_question,
 )
 from models.qwen import QwenWrapper
 from models.scoring import embed_statements, generate_text
+from tqdm import tqdm
 
 
 METHODS = ["no_history", "direct_icl", "random_k", "similarity_k", "recent_k"]
@@ -45,14 +46,31 @@ def make_prompt(wrapper, instructions, demonstrations, target_rows):
             {"role": "user", "content": round_question(round_id, row)},
             {"role": "assistant", "content": str(int(row["rPrice"]))},
         ])
-    query = "Predict reserve prices for these rounds:\n" + "\n".join(
-        f"round {round_id}: {int(row['numBidders'])} bidders, drop-out prices {bid_prices(row)}"
+    query = "\n".join(
+        f"Predict the reserve price for round {round_id}: {int(row['numBidders'])} bidders, "
+        f"drop-out prices {bid_prices(row)}. Reply exactly 'round {round_id}: integer' "
+        "with an integer from 0 to 100 and no explanation."
         for round_id, row in target_rows
     )
     messages.append({"role": "user", "content": query})
     return wrapper.tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
     )
+
+
+def parse_one_prediction(text, round_id):
+    match = re.search(
+        rf"\bround\s*{round_id}\s*[:=-]\s*(\d{{1,3}})\b", text, re.IGNORECASE,
+    )
+    if match:
+        value = int(match.group(1))
+        return value if 0 <= value <= 100 else None
+    values = re.findall(r"(?<!\d)(?:100|[1-9]?\d)(?!\d)", text)
+    if len(values) == 1:
+        return int(values[0])
+    if text.strip().isdigit() and 0 <= int(text.strip()) <= 100:
+        return int(text.strip())
+    return None
 
 
 def parse_args():
@@ -71,7 +89,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--random_repeats", type=int, default=3)
     parser.add_argument("--max_input_len", type=int, default=16384)
-    parser.add_argument("--max_new_tokens", type=int, default=384)
+    parser.add_argument("--max_new_tokens", type=int, default=32)
     parser.add_argument("--bidder_groups", nargs="*")
     return parser.parse_args()
 
@@ -106,24 +124,26 @@ def run_group(wrapper, rows, group, instructions, args, methods):
     predictions_by_method = {}
 
     for method in methods:
+        predictions = {}
+        selected_by_round = {}
         if method == "similarity_k":
-            predictions = {}
-            selected_by_round = {}
-            for target_index, (round_id, target_row) in enumerate(future):
-                selected = similarity_indices[target_index].flip(0).tolist()
-                demos = [(i + 1, context[i]) for i in selected]
-                selected_by_round[round_id] = demos
-                prompt = make_prompt(wrapper, instructions, demos, [(round_id, target_row)])
-                generated = generate_text(wrapper, prompt, max_new_tokens=32)
-                predictions.update(parse_predictions(generated, round_id, round_id))
+            targets_to_run = enumerate(future)
         else:
             demos = selections[method]
-            selected_by_round = {round_id: demos for round_id, _ in future}
-            prompt = make_prompt(wrapper, instructions, demos, future)
+            targets_to_run = ((index, item) for index, item in enumerate(future))
+
+        for target_index, (round_id, target_row) in tqdm(
+            targets_to_run, total=len(future), desc=f"{group} {method}", leave=False,
+        ):
+            if method == "similarity_k":
+                selected = similarity_indices[target_index].flip(0).tolist()
+                demos = [(i + 1, context[i]) for i in selected]
+            selected_by_round[round_id] = demos
+            prompt = make_prompt(wrapper, instructions, demos, [(round_id, target_row)])
             generated = generate_text(wrapper, prompt, max_new_tokens=args.max_new_tokens)
-            predictions = parse_predictions(
-                generated, args.context_num + 1, len(rows),
-            )
+            prediction = parse_one_prediction(generated, round_id)
+            if prediction is not None:
+                predictions[round_id] = prediction
 
         predictions_by_method[method] = predictions
         for round_id, row in future:
