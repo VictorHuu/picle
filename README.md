@@ -156,6 +156,14 @@ run one PICLe condition. `Mask` hides round numbers in the selected examples;
 paper text defines Mask as masking round numbers, while its released helper
 script masks dropout-price lists; this implementation follows the paper text.
 
+Per-round predictions are written to `out/qwen/auction_picle.csv`. Per-group,
+per-condition evaluation metrics are written to `out/qwen/auction_picle_metrics.csv`:
+`w1_reserve_price` is the empirical 1-Wasserstein distance between the predicted
+and human held-out reserve-price distributions, in price units; `ks_distance`
+keeps the paper's original KS measure for comparison. Both use only held-out
+rounds with a valid parsed model prediction, and `n_scored` reports that count.
+Set `--metrics_file` to change the metrics output path.
+
 The participant's first 30 decisions are used for participant-specific LoRA
 SFT and as PICLe candidate demonstrations. PICLe selects Top-K by
 `log p_SFT(x) - log p_Base(x)`; the selected examples are then reordered or
