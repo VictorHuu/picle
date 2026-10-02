@@ -40,6 +40,18 @@ metrics are saved to `out/qwen/auction_picle_metrics.csv`:
 - `ks_distance`: KS distance, retained for comparison with the paper's metric.
 - `n_scored`: number of held-out rounds with valid parsed predictions.
 
+Run the five non-PICLe controls with one command:
+
+```bash
+python src/auction_baselines.py --mode all
+```
+
+This runs No-history, full-history Direct ICL, Random-K (three seeds), Similarity-K,
+and Recent-K. If `out/qwen/auction_picle.csv` exists, the metrics file also reports
+PICLe Direct on the exact common set of successfully predicted rounds across methods.
+Baseline predictions and metrics are written to
+`out/qwen/auction_baseline_predictions.csv` and `out/qwen/auction_baseline_metrics.csv`.
+
 PICLe selects demonstrations by
 `delta(x) = log p_SFT(x) - log p_Base(x)` and chooses the Top-K scores. All five
 conditions use these selected demonstrations; the four ablations change how their
